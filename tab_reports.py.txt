@@ -1,0 +1,1940 @@
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import sqlite3, os, csv
+from tkcalendar import Calendar
+from datetime import datetime
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.lib import colors
+# FIX #3: Added openpyxl for proper Excel export (replaces blank CSV issue)
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+import database
+
+def safe_float(val):
+    try:
+        return float(str(val).replace(',', '').strip() or 0)
+    except:
+        return 0.0
+
+def num_to_words(num):
+    units = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+             "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen",
+             "Eighteen", "Nineteen"]
+    tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+    if num == 0:
+        return "Zero"
+    def convert(n):
+        if n < 20: return units[int(n)]
+        if n < 100: return tens[int(n // 10)] + (" " + units[int(n % 10)] if n % 10 != 0 else "")
+        if n < 1000: return units[int(n // 100)] + " Hundred" + (" And " + convert(n % 100) if n % 100 != 0 else "")
+        if n < 100000: return convert(n // 1000) + " Thousand" + (" " + convert(n % 1000) if n % 1000 != 0 else "")
+        if n < 10000000: return convert(n // 100000) + " Lakh" + (" " + convert(n % 100000) if n % 100000 != 0 else "")
+        return convert(n // 10000000) + " Crore" + (" " + convert(n % 10000000) if n % 10000000 != 0 else "")
+    return convert(abs(int(num)))
+
+def build(app):
+    BG_MAIN = "#e2e8f0"
+    CARD_BG = "#ffffff"
+    TEXT_DARK = "#0f172a"
+
+    try:
+        conn = sqlite3.connect(database.DB_FILE)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS saved_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, report_name TEXT, party_name TEXT, date_from TEXT, date_to TEXT, created_at TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS global_receipts (receipt_no TEXT PRIMARY KEY, date TEXT, party TEXT, mode TEXT, ref_no TEXT, currency TEXT, total_amount REAL, remarks TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS account_settlements (id INTEGER PRIMARY KEY AUTOINCREMENT, job_no TEXT, party_name TEXT, settled_amount REAL, receipt_no TEXT)''')
+        c.execute("PRAGMA table_info(global_receipts)")
+        cols = [col[1] for col in c.fetchall()]
+        if 'remarks' not in cols:
+            try:
+                c.execute("ALTER TABLE global_receipts ADD COLUMN remarks TEXT")
+            except:
+                pass
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+    main_card = ctk.CTkFrame(app.frame_reports, fg_color=CARD_BG, corner_radius=10,
+                              border_width=1, border_color="#d1d5db")
+    main_card.pack(fill="both", expand=True, padx=30, pady=20)
+
+    filter_f = ctk.CTkFrame(main_card, fg_color="#f8fafc", corner_radius=8, border_width=1,
+                             border_color="#cbd5e1")
+    filter_f.pack(fill="x", padx=20, pady=20, ipadx=10, ipady=10)
+
+    ctk.CTkLabel(filter_f, text="🔍 Filters:", font=("Segoe UI", 14, "bold"),
+                 text_color=TEXT_DARK).pack(side="left", padx=10)
+
+    def pick_date(target_ent):
+        top = tk.Toplevel(app.root)
+        top.title("Select Date")
+        top.geometry("280x250")
+        top.grab_set()
+        cal = Calendar(top, selectmode='day', date_pattern='dd/mm/yyyy')
+        cal.pack(pady=10, expand=True, fill=tk.BOTH, padx=10)
+        def set_d():
+            target_ent.delete(0, tk.END)
+            target_ent.insert(0, cal.get_date())
+            top.destroy()
+        tk.Button(top, text="Select Date", command=set_d, bg="#10b981", fg="white",
+                  font=("Segoe UI", 10, "bold")).pack(pady=10)
+
+    ctk.CTkLabel(filter_f, text="From:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=2)
+    ent_from = ctk.CTkEntry(filter_f, width=100, placeholder_text="DD/MM/YYYY")
+    ent_from.pack(side="left", padx=2)
+    ctk.CTkButton(filter_f, text="📅", width=25, fg_color="#cbd5e1", text_color="black",
+                  command=lambda: pick_date(ent_from)).pack(side="left", padx=2)
+
+    ctk.CTkLabel(filter_f, text="To:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(10, 2))
+    ent_to = ctk.CTkEntry(filter_f, width=100, placeholder_text="DD/MM/YYYY")
+    ent_to.pack(side="left", padx=2)
+    ctk.CTkButton(filter_f, text="📅", width=25, fg_color="#cbd5e1", text_color="black",
+                  command=lambda: pick_date(ent_to)).pack(side="left", padx=2)
+
+    party_list = ["ALL"]
+    try:
+        conn = sqlite3.connect(database.DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT description FROM cost_items WHERE description IS NOT NULL AND description != ''")
+        for row in c.fetchall():
+            party_list.append(str(row[0]).strip().upper())
+        c.execute("SELECT DISTINCT customer FROM cost_master WHERE customer IS NOT NULL AND customer != ''")
+        for row in c.fetchall():
+            party_list.append(str(row[0]).strip().upper())
+        c.execute("SELECT DISTINCT consignee FROM bl_details WHERE consignee IS NOT NULL AND consignee != ''")
+        for row in c.fetchall():
+            party_list.append(str(row[0]).split('\n')[0].strip().upper())
+        try:
+            c.execute("SELECT DISTINCT invoice_to FROM invoice_master WHERE invoice_to IS NOT NULL AND invoice_to != ''")
+            for row in c.fetchall():
+                party_list.append(str(row[0]).split('\n')[0].strip().upper())
+        except:
+            pass
+        party_list = sorted(list(set(party_list)))
+        if "ALL" in party_list:
+            party_list.remove("ALL")
+        party_list.insert(0, "ALL")
+        conn.close()
+    except:
+        pass
+
+    ctk.CTkLabel(filter_f, text="Party:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(10, 2))
+
+    # FIX-4: Searchable party field with live dropdown (fixed selection + no freeze)
+    party_search_var = tk.StringVar(value="ALL")
+    ent_party_search = ctk.CTkEntry(filter_f, width=180, textvariable=party_search_var,
+                                    placeholder_text="Type to search...")
+    ent_party_search.pack(side="left", padx=2)
+
+    party_dropdown_win = [None]
+    _dropdown_items = []
+
+    def _close_party_dropdown():
+        if party_dropdown_win[0]:
+            try: party_dropdown_win[0].destroy()
+            except: pass
+        party_dropdown_win[0] = None
+
+    def show_party_dropdown(*_):
+        typed = party_search_var.get().strip().upper()
+        filtered = [p for p in party_list if typed in p.upper()] if typed and typed != "ALL" else party_list
+        _close_party_dropdown()
+        if not filtered:
+            return
+        _dropdown_items.clear()
+        _dropdown_items.extend(filtered)
+        win = tk.Toplevel(app.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        ent_party_search.update_idletasks()
+        x = ent_party_search.winfo_rootx()
+        y = ent_party_search.winfo_rooty() + ent_party_search.winfo_height() + 2
+        h = min(len(filtered), 10) * 22 + 4
+        win.geometry(f"220x{h}+{x}+{y}")
+        lb = tk.Listbox(win, font=("Segoe UI", 10), bg="#1e293b", fg="white",
+                        selectbackground="#38bdf8", selectforeground="#0f172a",
+                        bd=0, highlightthickness=0, activestyle="none")
+        lb.pack(fill="both", expand=True)
+        for p in filtered:
+            lb.insert(tk.END, p)
+        def on_select(event):
+            idx = lb.nearest(event.y)
+            if 0 <= idx < len(_dropdown_items):
+                party_search_var.set(_dropdown_items[idx])
+                win.after(10, _close_party_dropdown)
+        lb.bind("<ButtonRelease-1>", on_select)
+        def on_key(event):
+            sel = lb.curselection()
+            if sel and event.keysym == "Return":
+                party_search_var.set(_dropdown_items[sel[0]])
+                _close_party_dropdown()
+            elif event.keysym == "Escape":
+                _close_party_dropdown()
+        lb.bind("<KeyPress>", on_key)
+        def _check_click_outside(event):
+            wx, wy = win.winfo_rootx(), win.winfo_rooty()
+            ww, wh = win.winfo_width(), win.winfo_height()
+            if not (wx <= event.x_root <= wx + ww and wy <= event.y_root <= wy + wh):
+                _close_party_dropdown()
+        win.bind_all("<Button-1>", _check_click_outside, add="+")
+        party_dropdown_win[0] = win
+
+    ent_party_search.bind("<KeyRelease>", show_party_dropdown)
+    ent_party_search.bind("<FocusIn>", show_party_dropdown)
+
+    class _PartyProxy:
+        def get(self): return party_search_var.get()
+        def set(self, v): party_search_var.set(v)
+    ent_party = _PartyProxy()
+
+    ctk.CTkLabel(filter_f, text="Status:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(10, 2))
+    ent_status = ctk.CTkComboBox(filter_f, values=["ALL", "NO DUE", "Pending", "Partial Payment",
+                                                    "Settled", "EXCESS RCV"], width=130)
+    ent_status.set("ALL")
+    ent_status.pack(side="left", padx=2)
+
+    # UPDATE-1: Search by Job No, HBL, Container
+    ctk.CTkLabel(filter_f, text="Search:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(10, 2))
+    ent_search = ctk.CTkEntry(filter_f, width=150, placeholder_text="Job, HBL, Cont...")
+    ent_search.pack(side="left", padx=2)
+
+    table_f = ctk.CTkFrame(main_card, fg_color="transparent")
+    table_f.pack(fill="both", expand=True, padx=20, pady=5)
+
+    cols = ("Select", "Job No", "Date", "PARTY", "HBL No", "Container No", "POL", "ETA",
+            "Payable", "Receivable", "Status")
+    tree = ttk.Treeview(table_f, columns=cols, show="headings", height=15)
+
+    style = ttk.Style()
+    style.theme_use("default")
+    style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"), background="#1e293b",
+                    foreground="white")
+    style.configure("Treeview", font=("Segoe UI", 10), rowheight=32)
+
+    tree_tags_configured = [False]
+
+    widths = [50, 80, 80, 160, 100, 120, 80, 80, 90, 90, 100]
+    for col, w in zip(cols, widths):
+        tree.heading(col, text=col)
+        tree.column(col, width=w, anchor="center" if col not in ["PARTY"] else "w")
+
+    scroll_y = ttk.Scrollbar(table_f, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=scroll_y.set)
+    scroll_y.pack(side="right", fill="y")
+    tree.pack(fill="both", expand=True)
+
+    # Configure status row tag colors
+    tree.tag_configure("tag_settled", foreground="#15803d", font=("Segoe UI", 10, "bold"))
+    tree.tag_configure("tag_pending", foreground="#dc2626", font=("Segoe UI", 10, "bold"))
+    tree.tag_configure("tag_nodue",   foreground="#1d4ed8", font=("Segoe UI", 10, "bold"))
+    tree.tag_configure("tag_partial", foreground="#b45309", font=("Segoe UI", 10, "bold"))
+    tree.tag_configure("tag_excess",  foreground="#059669", font=("Segoe UI", 10, "bold"))
+
+    report_data = []
+
+    def apply_local_filter(*args):
+        query = ent_search.get().strip().upper()
+        for r in tree.get_children():
+            tree.delete(r)
+        for row in report_data:
+            job_no    = str(row[1]).upper()
+            hbl       = str(row[4]).upper()
+            container = str(row[5]).upper()
+            if query and query not in job_no and query not in hbl and query not in container:
+                continue
+            status = row[10]
+            status_upper = str(status).upper()
+            if status_upper == "SETTLED":
+                display_status = "✔ SETTLED"
+                row_tag = "tag_settled"
+            elif status_upper == "EXCESS RCV":
+                display_status = "⚠ EXCESS RCV"
+                row_tag = "tag_excess"
+            elif status_upper == "PENDING":
+                display_status = "⚑ PENDING"
+                row_tag = "tag_pending"
+            elif "NO DUE" in status_upper:
+                display_status = "⚑ NO DUES"
+                row_tag = "tag_nodue"
+            elif "PARTIAL" in status_upper:
+                display_status = "⚑ PARTIAL PMT"
+                row_tag = "tag_partial"
+            else:
+                display_status = status
+                row_tag = ""
+            display_vals = row[:10] + [display_status]
+            tree.insert("", tk.END, values=display_vals, tags=(row_tag,) if row_tag else ())
+
+    ent_search.bind("<KeyRelease>", apply_local_filter)
+
+    def toggle_check(event):
+        region = tree.identify("region", event.x, event.y)
+        if region == "cell":
+            column = tree.identify_column(event.x)
+            if column == '#1':
+                item = tree.identify_row(event.y)
+                current_val = tree.set(item, "Select")
+                new_val = "[ \u2713 ]" if current_val == "[ ]" else "[ ]"
+                tree.set(item, "Select", new_val)
+                job_no = tree.set(item, "Job No")
+                for r in report_data:
+                    if r[1] == job_no:
+                        r[0] = new_val
+                        break
+    tree.bind('<1>', toggle_check)
+
+    def on_tree_double_click(event):
+        region = tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        item_id = tree.identify_row(event.y)
+        if not item_id:
+            return
+        item_vals = tree.item(item_id)["values"]
+        if not item_vals or len(item_vals) < 11:
+            return
+        job_no = str(item_vals[1]).strip()
+        party  = str(item_vals[3]).strip()
+        conn = sqlite3.connect(database.DB_FILE)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        party_upper = party.upper()
+        c.execute("""SELECT receipt_no FROM account_settlements
+                     WHERE job_no=?
+                     AND (UPPER(party_name) = ?
+                       OR UPPER(?) LIKE '%' || UPPER(party_name) || '%'
+                       OR UPPER(party_name) LIKE '%' || UPPER(?) || '%')
+                     ORDER BY id DESC LIMIT 1""",
+                  (job_no, party_upper, party_upper, party_upper))
+        res = c.fetchone()
+        conn.close()
+        if res and res['receipt_no']:
+            open_payment_popup(existing_receipt_no=res['receipt_no'], auto_pdf=False)
+    tree.bind('<Double-1>', on_tree_double_click)
+
+    def do_main_tree_popup(event):
+        sel_row = tree.identify_row(event.y)
+        if sel_row:
+            tree.selection_set(sel_row)
+            item_vals = tree.item(sel_row)["values"]
+            if not item_vals or len(item_vals) < 11: return
+            job_no = item_vals[1]
+            party  = item_vals[3]
+            conn = sqlite3.connect(database.DB_FILE)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            party_upper = party.upper()
+            c.execute("""SELECT receipt_no FROM account_settlements
+                         WHERE job_no=?
+                         AND (UPPER(party_name) = ?
+                           OR UPPER(?) LIKE '%' || UPPER(party_name) || '%'
+                           OR UPPER(party_name) LIKE '%' || UPPER(?) || '%')
+                         ORDER BY id DESC LIMIT 1""",
+                      (job_no, party_upper, party_upper, party_upper))
+            res = c.fetchone()
+            conn.close()
+            if res and res['receipt_no']:
+                menu = tk.Menu(main_card, tearoff=0)
+                menu.add_command(label="👁 View Receipt",
+                                 command=lambda: open_payment_popup(existing_receipt_no=res['receipt_no'], auto_pdf=False))
+                menu.add_command(label="📄 Download Receipt",
+                                 command=lambda: open_payment_popup(existing_receipt_no=res['receipt_no'], auto_pdf=True))
+                menu.tk_popup(event.x_root, event.y_root)
+    tree.bind("<Button-3>", do_main_tree_popup)
+
+    tot_f = ctk.CTkFrame(main_card, fg_color="#f8fafc", corner_radius=5)
+    tot_f.pack(fill="x", padx=20, pady=10, ipadx=10, ipady=10)
+
+    lbl_pay = ctk.CTkLabel(tot_f, text="Total Payable: 0.00", font=("Segoe UI", 14, "bold"),
+                           text_color="#ef4444")
+    lbl_pay.pack(side="left", padx=20)
+    lbl_rec = ctk.CTkLabel(tot_f, text="Total Receivable: 0.00", font=("Segoe UI", 14, "bold"),
+                           text_color="#10b981")
+    lbl_rec.pack(side="left", padx=20)
+    lbl_bal = ctk.CTkLabel(tot_f, text="Net Balance: 0.00", font=("Segoe UI", 16, "bold"),
+                           text_color="#2563eb")
+    lbl_bal.pack(side="right", padx=20)
+
+    def load_report():
+        for r in tree.get_children():
+            tree.delete(r)
+        report_data.clear()
+
+        p_name    = ent_party.get().strip().upper()
+        if p_name == "ALL":
+            p_name = ""
+        d_from_str = ent_from.get().strip()
+        d_to_str   = ent_to.get().strip()
+        s_filter   = ent_status.get()
+
+        try:
+            d_from = datetime.strptime(d_from_str, "%d/%m/%Y") if d_from_str else None
+        except:
+            d_from = None
+        try:
+            d_to = datetime.strptime(d_to_str, "%d/%m/%Y") if d_to_str else None
+        except:
+            d_to = None
+
+        try:
+            conn = sqlite3.connect(database.DB_FILE)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            if p_name:
+                c.execute("SELECT job_no, description, type, amount FROM cost_items WHERE UPPER(description) LIKE ?",
+                          (f"%{p_name}%",))
+            else:
+                c.execute("SELECT job_no, description, type, amount FROM cost_items")
+            items = c.fetchall()
+
+            grouped_data = {}
+            for item in items:
+                j_no  = item['job_no']
+                party = str(item['description'] or "UNKNOWN").strip().upper()
+                key   = (j_no, party)
+                if key not in grouped_data:
+                    grouped_data[key] = {'pay': 0.0, 'rec': 0.0}
+                typ = str(item['type']).upper()
+                amt = float(item['amount'] or 0)
+                if typ == 'PAYABLE':
+                    grouped_data[key]['pay'] += amt
+                elif typ == 'RECEIVABLE':
+                    grouped_data[key]['rec'] += amt
+
+            # ADD INVOICE TOTAL AS RECEIVABLE
+            try:
+                c.execute("SELECT * FROM invoice_master")
+                for inv in c.fetchall():
+                    j_no       = str(inv['job_no'])
+                    inv_no     = str(inv['invoice_no'])
+                    party_name = "UNKNOWN"
+                    if inv['invoice_to']:
+                        party_name = str(inv['invoice_to']).split('\n')[0].strip().upper()
+                    if party_name == "UNKNOWN":
+                        try:
+                            c.execute("SELECT consignee FROM bl_details WHERE job_no=?", (j_no,))
+                            r_bl = c.fetchone()
+                            if r_bl and r_bl['consignee']:
+                                party_name = str(r_bl['consignee']).split('\n')[0].strip().upper()
+                        except: pass
+                    if p_name and p_name not in party_name:
+                        continue
+                    inv_amt = 0.0
+                    for tbl in ['invoice_charges', 'invoice_items']:
+                        try:
+                            c.execute(f"SELECT total FROM {tbl} WHERE job_no=?", (j_no,))
+                            inv_amt = sum(safe_float(i[0]) for i in c.fetchall())
+                            if inv_amt > 0: break
+                        except:
+                            try:
+                                c.execute(f"SELECT total FROM {tbl} WHERE invoice_no=?", (inv_no,))
+                                inv_amt = sum(safe_float(i[0]) for i in c.fetchall())
+                                if inv_amt > 0: break
+                            except: pass
+                    if inv_amt == 0:
+                        try: inv_amt = safe_float(inv['grand_total'])
+                        except: pass
+                    if inv_amt > 0:
+                        key = (j_no, party_name)
+                        if key not in grouped_data:
+                            grouped_data[key] = {'pay': 0.0, 'rec': 0.0}
+                        grouped_data[key]['rec'] += inv_amt
+            except:
+                pass
+
+            t_pay, t_rec = 0.0, 0.0
+
+            for (j_no, party), amounts in grouped_data.items():
+                payable     = round(amounts['pay'])
+                receivable  = round(amounts['rec'])
+                job_balance = receivable - payable
+
+                # FIX-1: Use LIKE fuzzy match
+                party_upper = party.upper()
+                c.execute("""SELECT SUM(settled_amount) as s_amt FROM account_settlements
+                             WHERE job_no=? AND (
+                               UPPER(party_name) = ?
+                               OR UPPER(?) LIKE '%' || UPPER(party_name) || '%'
+                               OR UPPER(party_name) LIKE '%' || UPPER(?) || '%'
+                             )""", (j_no, party_upper, party_upper, party_upper))
+                s_res = c.fetchone()
+                settled_so_far = round(float(s_res['s_amt'] or 0) if s_res else 0.0, 2)
+
+                # ── STATUS LOGIC (FIXED) ──────────────────────────────────────────
+                # Use round(..., 2) — keeps paisa precision, avoids integer rounding
+                # errors. TOLERANCE of 0.01 ensures exact matches (e.g. 4400 == 4400)
+                # never accidentally trigger EXCESS RCV due to float residues.
+                abs_balance = round(abs(job_balance), 2)
+                abs_settled = round(abs(settled_so_far), 2)
+
+                # Convert to integers (cents) to completely eliminate float precision issues
+                bal_cents = int(round(abs_balance * 100))
+                set_cents = int(round(abs_settled * 100))
+
+                if bal_cents == 0:
+                    if set_cents > 0:
+                        status = "EXCESS RCV"
+                    else:
+                        status = "NO DUE"
+                elif set_cents > bal_cents:
+                    status = "EXCESS RCV"
+                elif set_cents == bal_cents:
+                    status = "Settled"
+                elif set_cents > 0:
+                    status = "Partial Payment"
+                else:
+                    status = "Pending"
+                # ── END STATUS LOGIC ──────────────────────────────────────────────
+
+                if s_filter != "ALL" and status.upper() != s_filter.upper():
+                    continue
+
+                c.execute("SELECT * FROM bl_details WHERE job_no=?", (j_no,))
+                bl_r = c.fetchone()
+                bl = dict(bl_r) if bl_r else {}
+
+                c.execute("SELECT * FROM cost_master WHERE job_no=?", (j_no,))
+                cm_r = c.fetchone()
+                cm = dict(cm_r) if cm_r else {}
+
+                c.execute("SELECT * FROM arrival_details WHERE job_no=?", (j_no,))
+                ar_r = c.fetchone()
+                arr = dict(ar_r) if ar_r else {}
+
+                j_date_str = str(bl.get('job_date', '') or cm.get('eta_date', '') or cm.get('eta', '')).strip()
+
+                if d_from or d_to:
+                    if not j_date_str:
+                        continue
+                    try:
+                        jd = datetime.strptime(j_date_str, "%d/%m/%Y")
+                        if d_from and jd < d_from:
+                            continue
+                        if d_to and jd > d_to:
+                            continue
+                    except:
+                        continue
+
+                # UPDATE-3: include in totals ONLY Pending / Partial Payment jobs
+                if status.upper() in ("PENDING", "PARTIAL PAYMENT"):
+                    t_pay += payable
+                    t_rec += receivable
+
+                mbl      = bl.get('mbl_no', '')
+                hbl      = bl.get('hbl_no', cm.get('hbl_no', ''))
+                raw_cont = bl.get('container_seal', cm.get('container_no', ''))
+                if raw_cont:
+                    raw_cont = str(raw_cont).strip()
+                    conts = [c.strip() for c in raw_cont.replace(',', '\n').replace('&', '\n').replace('+', '\n').split('\n') if c.strip()]
+                    if len(conts) > 1:
+                        container_no = f"{conts[0].split('/')[0].strip()} (+)"
+                    elif len(conts) == 1:
+                        single = conts[0]
+                        if single.count('/') > 1 or len(single) > 25:
+                            container_no = f"{single.split('/')[0].strip()} (+)"
+                        else:
+                            container_no = single.split('/')[0].strip()
+                    else:
+                        container_no = ""
+                else:
+                    container_no = ""
+
+                pol   = bl.get('pol', cm.get('origin', ''))
+                pod   = bl.get('pod', cm.get('destination', ''))
+                vsl   = arr.get('vessel', '')
+                voy   = arr.get('voyage', '')
+                v_voy = f"{vsl} / {voy}".strip(" /")
+                if v_voy == "/":
+                    v_voy = ""
+                eta = arr.get('due_arrival', cm.get('eta_date', cm.get('eta', '')))
+
+                row_vals = [
+                    "[ ]", j_no, j_date_str, party, hbl, container_no, pol, eta,
+                    f"{payable:,.2f}" if payable else "0.00",
+                    f"{receivable:,.2f}" if receivable else "0.00",
+                    status, mbl, pod, v_voy
+                ]
+                report_data.append(row_vals)
+
+            lbl_pay.configure(text=f"Total Payable: {t_pay:,.2f}")
+            lbl_rec.configure(text=f"Total Receivable: {t_rec:,.2f}")
+            lbl_bal.configure(text=f"Net Balance: {(t_rec - t_pay):,.2f}")
+            conn.close()
+            apply_local_filter()
+
+        except Exception as e:
+            messagebox.showerror("Database Error", str(e))
+
+    ctk.CTkButton(filter_f, text="🔄 Generate", fg_color="#3b82f6", font=("Segoe UI", 12, "bold"),
+                  width=90, command=load_report).pack(side="right", padx=5)
+
+    def clear_filters():
+        ent_party.set("ALL")
+        ent_status.set("ALL")
+        ent_from.delete(0, tk.END)
+        ent_to.delete(0, tk.END)
+        ent_search.delete(0, tk.END)
+        for r in tree.get_children():
+            tree.delete(r)
+        report_data.clear()
+        lbl_pay.configure(text="Total Payable: 0.00")
+        lbl_rec.configure(text="Total Receivable: 0.00")
+        lbl_bal.configure(text="Net Balance: 0.00")
+        load_report()
+
+    ctk.CTkButton(filter_f, text="✖ Clear", fg_color="#94a3b8", text_color="black",
+                  font=("Segoe UI", 12, "bold"), width=60,
+                  command=clear_filters).pack(side="right", padx=5)
+
+    def open_saved_receipts_manager():
+        top = ctk.CTkToplevel(app.root)
+        top.title("Saved Receipts Manager")
+        top.geometry("900x580")
+        top.grab_set()
+
+        ctk.CTkLabel(top, text="📂 View & Edit Saved Receipts", font=("Segoe UI", 16, "bold"),
+                     text_color=TEXT_DARK).pack(pady=(15, 5))
+        ctk.CTkLabel(top, text="(Double-click to Download PDF | Right-click to Edit or Delete)",
+                     font=("Segoe UI", 10, "italic"), text_color="#64748b").pack(pady=(0, 5))
+
+        # FIX-2: Search bar + Payable/Receivable filter
+        srch_f = ctk.CTkFrame(top, fg_color="#f8fafc", corner_radius=6, border_width=1,
+                              border_color="#cbd5e1")
+        srch_f.pack(fill="x", padx=20, pady=(0, 8), ipadx=8, ipady=6)
+        ctk.CTkLabel(srch_f, text="🔍 Search:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=8)
+        srch_var = tk.StringVar()
+        srch_entry = ctk.CTkEntry(srch_f, textvariable=srch_var, width=160,
+                                  placeholder_text="Receipt No / Party...")
+        srch_entry.pack(side="left", padx=4)
+        ctk.CTkLabel(srch_f, text="Type:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(12, 2))
+        rec_type_var = tk.StringVar(value="ALL")
+        rec_type_cb = ctk.CTkComboBox(srch_f, values=["ALL", "Payable Receipts", "Receivable Receipts"],
+                                      variable=rec_type_var, width=150)
+        rec_type_cb.set("ALL")
+        rec_type_cb.pack(side="left", padx=4)
+
+        ctk.CTkLabel(srch_f, text="Date Sort:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(12, 2))
+        sort_var = tk.StringVar(value="New to Old")
+        sort_cb = ctk.CTkComboBox(srch_f, values=["New to Old", "Old to New"], variable=sort_var, width=120)
+        sort_cb.pack(side="left", padx=4)
+
+        _all_receipts = []
+
+        tree_rec = ttk.Treeview(top, columns=("Receipt No", "Date", "Party", "Amount", "Type"),
+                                show="headings", height=14)
+        tree_rec.heading("Receipt No", text="Receipt No")
+        tree_rec.heading("Date",       text="Date")
+        tree_rec.heading("Party",      text="Party / Agent")
+        tree_rec.heading("Amount",     text="Total Amount")
+        tree_rec.heading("Type",       text="Type")
+        tree_rec.column("Receipt No", width=120, anchor="center")
+        tree_rec.column("Date",       width=100, anchor="center")
+        tree_rec.column("Party",      width=310)
+        tree_rec.column("Amount",     width=110, anchor="e")
+        tree_rec.column("Type",       width=110, anchor="center")
+
+        sb_rec = ttk.Scrollbar(top, orient="vertical", command=tree_rec.yview)
+        tree_rec.configure(yscrollcommand=sb_rec.set)
+        sb_rec.pack(side="right", fill="y", padx=(0, 5))
+        tree_rec.pack(fill="both", expand=True, padx=20, pady=5)
+
+        def refresh_manager():
+            _all_receipts.clear()
+            conn = sqlite3.connect(database.DB_FILE)
+            c = conn.cursor()
+            try:
+                c.execute("SELECT receipt_no, date, party, total_amount FROM global_receipts")
+                rows = c.fetchall()
+                def parse_sort_key(row):
+                    # Primary: parse receipt_no which contains YYYYMMDD-HHMMSS
+                    # e.g. REC-20260503-132417 → sortable, handles same-day ordering
+                    try:
+                        parts = row[0].split('-')  # ['REC', '20260503', '132417']
+                        if len(parts) >= 3:
+                            return datetime.strptime(f"{parts[1]}-{parts[2]}", "%Y%m%d-%H%M%S")
+                    except:
+                        pass
+                    # Fallback: parse the human-readable date string column
+                    d_str = row[1]
+                    try: return datetime.strptime(d_str, "%d-%b-%Y")
+                    except:
+                        try: return datetime.strptime(d_str, "%d/%m/%Y")
+                        except: return datetime.min
+                rows = sorted(rows, key=parse_sort_key)
+                for r in rows:
+                    rtype = "Receivable"
+                    c.execute("SELECT job_no, party_name FROM account_settlements WHERE receipt_no=? LIMIT 1", (r[0],))
+                    st_row = c.fetchone()
+                    if st_row:
+                        j = st_row[0]; pn = st_row[1]
+                        c.execute("SELECT type, amount FROM cost_items WHERE job_no=? AND UPPER(description)=?",
+                                  (j, pn.upper()))
+                        items = c.fetchall()
+                        pay = sum(float(i[1] or 0) for i in items if str(i[0]).upper() == 'PAYABLE')
+                        rec = sum(float(i[1] or 0) for i in items if str(i[0]).upper() == 'RECEIVABLE')
+                        if pay > rec:
+                            rtype = "Payable"
+                    _all_receipts.append((r[0], r[1], r[2], f"{r[3]:,.2f}", rtype))
+            except:
+                pass
+            conn.close()
+            _apply_filter()
+
+        def _apply_filter(*_):
+            for r in tree_rec.get_children():
+                tree_rec.delete(r)
+            typed        = srch_var.get().strip().upper()
+            rtype_filter = rec_type_var.get()
+            
+            def parse_sort_key_local(row):
+                try:
+                    parts = row[0].split('-')  # e.g., REC-20260503-132417
+                    if len(parts) >= 3:
+                        return datetime.strptime(f"{parts[1]}-{parts[2]}", "%Y%m%d-%H%M%S")
+                except: pass
+                d_str = row[1]
+                try: return datetime.strptime(d_str, "%d-%b-%Y")
+                except:
+                    try: return datetime.strptime(d_str, "%d/%m/%Y")
+                    except: return datetime.min
+
+            is_desc = (sort_var.get() == "New to Old")
+            sorted_receipts = sorted(_all_receipts, key=parse_sort_key_local, reverse=is_desc)
+
+            for row in sorted_receipts:
+                rno, date, party, amt, rtype = row
+                if typed and typed not in rno.upper() and typed not in party.upper():
+                    continue
+                if rtype_filter == "Payable Receipts" and rtype != "Payable":
+                    continue
+                if rtype_filter == "Receivable Receipts" and rtype != "Receivable":
+                    continue
+                color_tag = "pay_row" if rtype == "Payable" else "rec_row"
+                tree_rec.insert("", "end", values=(rno, date, party, amt, rtype), tags=(color_tag,))
+            tree_rec.tag_configure("pay_row", foreground="#dc2626")
+            tree_rec.tag_configure("rec_row", foreground="#059669")
+
+        srch_var.trace_add("write", _apply_filter)
+        rec_type_cb.configure(command=_apply_filter)
+        sort_cb.configure(command=_apply_filter)
+        refresh_manager()
+
+        def edit_selected_receipt(event=None):
+            sel = tree_rec.selection()
+            if not sel: return
+            item = tree_rec.item(sel[0])
+            r_no = item['values'][0]
+            top.destroy()
+            open_payment_popup(existing_receipt_no=r_no, auto_pdf=False)
+
+        def pdf_selected_receipt(event=None):
+            sel = tree_rec.selection()
+            if not sel: return
+            item = tree_rec.item(sel[0])
+            r_no = item['values'][0]
+            top.destroy()
+            open_payment_popup(existing_receipt_no=r_no, auto_pdf=True)
+
+        def delete_selected_receipt():
+            sel = tree_rec.selection()
+            if not sel: return
+            r_no = tree_rec.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirm Delete",
+                                   f"Are you sure you want to completely delete Receipt: {r_no}?\n\nThis will reset job statuses.",
+                                   parent=top):
+                try:
+                    conn = sqlite3.connect(database.DB_FILE)
+                    c = conn.cursor()
+                    c.execute("DELETE FROM global_receipts WHERE receipt_no=?", (r_no,))
+                    c.execute("DELETE FROM account_settlements WHERE receipt_no=?", (r_no,))
+                    conn.commit()
+                    conn.close()
+                    refresh_manager()
+                    load_report()
+                    messagebox.showinfo("Deleted", "Receipt deleted successfully.", parent=top)
+                except Exception as e:
+                    messagebox.showerror("Error", str(e), parent=top)
+
+        def do_popup(event):
+            sel_row = tree_rec.identify_row(event.y)
+            if sel_row:
+                tree_rec.selection_set(sel_row)
+                menu = tk.Menu(top, tearoff=0)
+                menu.add_command(label="✏ Edit Receipt",           command=edit_selected_receipt)
+                menu.add_command(label="📄 Download / View PDF",   command=pdf_selected_receipt)
+                menu.add_separator()
+                menu.add_command(label="🗑 Delete Receipt",        command=delete_selected_receipt)
+                menu.tk_popup(event.x_root, event.y_root)
+
+        tree_rec.bind("<Button-3>",  do_popup)
+        tree_rec.bind("<Double-1>",  pdf_selected_receipt)
+
+    ctk.CTkButton(filter_f, text="📂 View Saved Receipts", fg_color="#8b5cf6", hover_color="#7c3aed",
+                  font=("Segoe UI", 12, "bold"),
+                  command=open_saved_receipts_manager).pack(side="right", padx=5)
+
+    def open_payment_popup(existing_receipt_no=None, auto_pdf=False):
+        selected_items = []
+        party_name = ""
+        g_rec  = None
+        s_rows = []
+
+        if not existing_receipt_no:
+            selected_items = [item for item in report_data if item[0] == "[ \u2713 ]"]
+            if not selected_items:
+                messagebox.showwarning("No Job Selected",
+                                       "Please tick the checkbox '[ \u2713 ]' next to the jobs you want to settle.")
+                return
+            party_name = selected_items[0][3]
+            for item in selected_items:
+                if item[3] != party_name:
+                    messagebox.showwarning("Multiple Parties",
+                                           "Please select jobs belonging to the SAME Party/Agent for a single receipt.")
+                    return
+        else:
+            conn = sqlite3.connect(database.DB_FILE)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM global_receipts WHERE receipt_no=?", (existing_receipt_no,))
+            g_rec = c.fetchone()
+            if not g_rec:
+                conn.close()
+                return
+            party_name = g_rec['party']
+            c.execute("SELECT * FROM account_settlements WHERE receipt_no=?", (existing_receipt_no,))
+            s_rows = c.fetchall()
+            conn.close()
+
+        pop = ctk.CTkToplevel(app.root)
+        if auto_pdf:
+            pop.withdraw()
+        pop.title("Official Receipt & Settlement" if not existing_receipt_no else
+                  f"Update Existing Receipt: {existing_receipt_no}")
+        pop.geometry("1400x700")
+        pop.configure(fg_color="#f8fafc")
+        if not auto_pdf:
+            pop.grab_set()
+
+        pop.rowconfigure(1, weight=1)
+        pop.columnconfigure(0, weight=1)
+
+        # FIX-3: Determine if this receipt is for payable (Pay To) or receivable (Receive From)
+        total_payable_check    = sum(safe_float(item[8]) for item in selected_items) if not existing_receipt_no else 0
+        total_receivable_check = sum(safe_float(item[9]) for item in selected_items) if not existing_receipt_no else 0
+        is_payable_receipt     = total_payable_check > total_receivable_check
+
+        header_f = ctk.CTkFrame(pop, fg_color="white", corner_radius=8, border_width=1,
+                                border_color="#cbd5e1")
+        header_f.grid(row=0, column=0, sticky="ew", padx=15, pady=15, ipadx=10, ipady=10)
+
+        ctk.CTkLabel(header_f, text="Receipt No:", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="e")
+        ent_r_no = ctk.CTkEntry(header_f, width=200)
+        ent_r_no.grid(row=0, column=1, padx=5, pady=5)
+
+        ctk.CTkLabel(header_f, text="Date:", font=("Segoe UI", 11, "bold")).grid(row=0, column=2, padx=10, pady=5, sticky="e")
+        ent_r_date = ctk.CTkEntry(header_f, width=120)
+        ent_r_date.grid(row=0, column=3, padx=5, pady=5)
+
+        from_label_text = "Pay To:" if is_payable_receipt else "Receive From:"
+        ctk.CTkLabel(header_f, text=from_label_text, font=("Segoe UI", 11, "bold")).grid(row=1, column=0, padx=10, pady=5, sticky="e")
+        ent_r_from = ctk.CTkEntry(header_f, width=350)
+        ent_r_from.grid(row=1, column=1, columnspan=3, padx=5, pady=5, sticky="w")
+
+        ctk.CTkLabel(header_f, text="Payment Mode:", font=("Segoe UI", 11, "bold")).grid(row=2, column=0, padx=10, pady=5, sticky="e")
+        ent_r_mode = ctk.CTkComboBox(header_f, values=["Adjustment", "Bank Transfer", "Cash", "Cheque"], width=150)
+        ent_r_mode.grid(row=2, column=1, padx=5, pady=5)
+
+        ctk.CTkLabel(header_f, text="Reference #:", font=("Segoe UI", 11, "bold")).grid(row=2, column=2, padx=10, pady=5, sticky="e")
+        ent_r_ref = ctk.CTkEntry(header_f, width=150)
+        ent_r_ref.grid(row=2, column=3, padx=5, pady=5)
+
+        ctk.CTkLabel(header_f, text="Currency:", font=("Segoe UI", 11, "bold")).grid(row=2, column=4, padx=10, pady=5, sticky="e")
+        ent_r_curr = ctk.CTkComboBox(header_f, values=["PKR", "USD", "AED", "GBP"], width=100)
+        ent_r_curr.grid(row=2, column=5, padx=5, pady=5)
+
+        if existing_receipt_no:
+            ent_r_no.insert(0, g_rec['receipt_no'])
+            ent_r_no.configure(state="disabled")
+            ent_r_date.insert(0, g_rec['date'])
+            ent_r_from.insert(0, g_rec['party'])
+            ent_r_mode.set(g_rec['mode'])
+            ent_r_ref.insert(0, g_rec['ref_no'] or "")
+            ent_r_curr.set(g_rec['currency'])
+        else:
+            auto_rno = f"REC-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            ent_r_no.insert(0, auto_rno)
+            ent_r_date.insert(0, datetime.now().strftime("%d-%b-%Y"))
+            ent_r_from.insert(0, party_name)
+
+        bottom_container = ctk.CTkFrame(pop, fg_color="transparent")
+        bottom_container.grid(row=2, column=0, sticky="ew", padx=0, pady=0)
+
+        tbl_f = ctk.CTkScrollableFrame(pop, fg_color="white", corner_radius=8, border_width=1,
+                                       border_color="#cbd5e1")
+        tbl_f.grid(row=1, column=0, sticky="nsew", padx=15, pady=5)
+
+        headers = ["S#", "Job No", "Date", "HBL", "POL", "ETA", "Payable", "Receivbl", "Balance", "Type", "Ex.Rate", "Settle Amt", "Act"]
+        widths  = [30, 80, 80, 140, 90, 100, 80, 80, 80, 90, 60, 90, 40]
+
+        h_row = ctk.CTkFrame(tbl_f, fg_color="#1e293b", corner_radius=5)
+        h_row.pack(fill="x")
+        for h, w in zip(headers, widths):
+            ctk.CTkLabel(h_row, text=h, font=("Segoe UI", 10, "bold"), text_color="white",
+                         width=w).pack(side="left", padx=2, pady=5)
+
+        settle_rows = []
+
+        foot_f = ctk.CTkFrame(bottom_container, fg_color="#f8fafc", border_width=1, border_color="#cbd5e1")
+        foot_f.pack(fill="x", padx=15, pady=5, ipadx=5, ipady=5)
+
+        lbl_r_words = ctk.CTkLabel(foot_f, text="The sum of: PKR Zero Only", font=("Segoe UI", 11, "bold"))
+        lbl_r_words.pack(side="left", padx=10)
+
+        tot_container = ctk.CTkFrame(foot_f, fg_color="transparent")
+        tot_container.pack(side="right", padx=10)
+
+        lbl_t_pay = ctk.CTkLabel(tot_container, text="Payable: 0.00",   text_color="#ef4444", font=("Segoe UI", 12, "bold"))
+        lbl_t_pay.pack(side="left", padx=10)
+        lbl_t_rec = ctk.CTkLabel(tot_container, text="Receivbl: 0.00",  text_color="#10b981", font=("Segoe UI", 12, "bold"))
+        lbl_t_rec.pack(side="left", padx=10)
+        lbl_t_bal = ctk.CTkLabel(tot_container, text="Balance: 0.00",   text_color="#2563eb", font=("Segoe UI", 12, "bold"))
+        lbl_t_bal.pack(side="left", padx=10)
+        lbl_r_total = ctk.CTkLabel(tot_container, text="Settle: 0.00",  font=("Segoe UI", 14, "bold"))
+        lbl_r_total.pack(side="left", padx=10)
+
+        def get_val(r_dict, key):
+            val = r_dict.get(key, "")
+            if hasattr(val, 'get'):
+                return str(val.get())
+            return str(val)
+
+        def calc_total(*args):
+            t_pay = t_rec = t_bal = t_set = 0.0
+            for r in settle_rows:
+                t_pay += safe_float(get_val(r, 'e_pay'))
+                t_rec += safe_float(get_val(r, 'e_rec'))
+                t_bal += safe_float(get_val(r, 'e_bal'))
+                t_set += safe_float(get_val(r, 'e_amt'))
+            lbl_t_pay.configure(text=f"Payable: {t_pay:,.2f}")
+            lbl_t_rec.configure(text=f"Receivbl: {t_rec:,.2f}")
+            lbl_r_total.configure(text=f"Settle: {t_set:,.2f}")
+            lbl_r_words.configure(text=f"The sum of: PKR {num_to_words(int(abs(t_set)))} Only")
+            
+            bal_cents = int(round(t_bal * 100))
+            set_cents = int(round(t_set * 100))
+            rem_cents = bal_cents - set_cents
+            remaining = rem_cents / 100.0
+            
+            # --- FINAL CONDITION MULTI-JOB LOGIC ---
+            if rem_cents < 0:
+                lbl_t_bal.configure(text=f"⚠ EXCESS RECEIVED: {abs(remaining):,.2f}", text_color="#059669")
+            elif rem_cents == 0 and set_cents > 0:
+                lbl_t_bal.configure(text="✔ SETTLED: 0.00", text_color="#15803d")
+            else:
+                lbl_t_bal.configure(text=f"PARTIAL / BAL: {remaining:,.2f}", text_color="#b45309")
+
+        def delete_settle_row(row_frame, row_data):
+            row_frame.destroy()
+            if row_data in settle_rows:
+                settle_rows.remove(row_data)
+            calc_total()
+
+        def create_row(idx_val, job_val, date_val, hmbl_val, pol_val, eta_val,
+                       pay_val, rec_val, bal_val, type_val, ex_val, amt_val, orig_party_val=""):
+            r_f = ctk.CTkFrame(tbl_f, fg_color="transparent")
+            r_f.pack(fill="x", pady=2)
+
+            def make_ent(w, val, color=TEXT_DARK, bold=False):
+                e = ctk.CTkEntry(r_f, width=w, text_color=color,
+                                 font=("Segoe UI", 10, "bold" if bold else "normal"))
+                e.insert(0, val)
+                e.pack(side="left", padx=2)
+                return e
+
+            ctk.CTkLabel(r_f, text=str(idx_val), width=widths[0]).pack(side="left", padx=2)
+            e_job  = make_ent(widths[1], job_val)
+            e_date = make_ent(widths[2], date_val)
+            e_hmbl = make_ent(widths[3], hmbl_val)
+            e_pol  = make_ent(widths[4], pol_val)
+            e_eta  = make_ent(widths[5], eta_val)
+            e_pay  = make_ent(widths[6], f"{safe_float(pay_val):.2f}", "#ef4444")
+            e_rec  = make_ent(widths[7], f"{safe_float(rec_val):.2f}", "#10b981")
+            e_bal  = make_ent(widths[8], f"{safe_float(bal_val):.2f}", "#2563eb", True)
+
+            e_type = ctk.CTkComboBox(r_f, values=["Regular", "Credit Note", "Advance"], width=widths[9])
+            e_type.set(type_val)
+            e_type.pack(side="left", padx=2)
+
+            e_ex  = make_ent(widths[10], ex_val)
+            e_amt = make_ent(widths[11], amt_val)
+
+            def update_row_balances(*args):
+                p = safe_float(e_pay.get())
+                r = safe_float(e_rec.get())
+                e_bal.delete(0, tk.END)
+                e_bal.insert(0, f"{abs(p - r):.2f}")
+                calc_total()
+
+            e_pay.bind("<KeyRelease>", update_row_balances)
+            e_rec.bind("<KeyRelease>", update_row_balances)
+            e_amt.bind("<KeyRelease>", calc_total)
+
+            row_data = {
+                "idx": idx_val, "e_job": e_job, "e_date": e_date, "e_hmbl": e_hmbl,
+                "e_pol": e_pol, "e_eta": e_eta, "e_pay": e_pay, "e_rec": e_rec,
+                "e_bal": e_bal, "e_type": e_type, "e_ex": e_ex, "e_amt": e_amt,
+                "orig_party": orig_party_val
+            }
+            btn_del = ctk.CTkButton(r_f, text="X", width=widths[12], fg_color="#ef4444",
+                                    command=lambda f=r_f, rd=row_data: delete_settle_row(f, rd))
+            btn_del.pack(side="left", padx=2)
+            settle_rows.append(row_data)
+
+        if not existing_receipt_no:
+            for idx, item in enumerate(selected_items):
+                pay = round(safe_float(item[8]))
+                rec = round(safe_float(item[9]))
+                bal = abs(pay - rec)
+                
+                # Fetch already settled amount to prevent duplicate/excess settlements
+                conn_tmp = sqlite3.connect(database.DB_FILE)
+                c_tmp = conn_tmp.cursor()
+                party_upper = party_name.upper()
+                c_tmp.execute("""SELECT SUM(settled_amount) FROM account_settlements 
+                                 WHERE job_no=? AND (
+                                   UPPER(party_name) = ?
+                                   OR UPPER(?) LIKE '%' || UPPER(party_name) || '%'
+                                   OR UPPER(party_name) LIKE '%' || UPPER(?) || '%'
+                                 )""", (item[1], party_upper, party_upper, party_upper))
+                res_tmp = c_tmp.fetchone()
+                settled_already = safe_float(res_tmp[0] if res_tmp and res_tmp[0] else 0.0)
+                conn_tmp.close()
+                
+                remaining_bal = bal - settled_already
+                if remaining_bal < 0:
+                    remaining_bal = 0.0
+
+                create_row(idx+1, item[1], item[2], item[4], item[6], item[7],
+                           pay, rec, remaining_bal, "Regular", "1.000", f"{remaining_bal:.2f}", party_name)
+        else:
+            conn = sqlite3.connect(database.DB_FILE)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            for idx, s in enumerate(s_rows):
+                j_no       = s['job_no']
+                s_amt      = safe_float(s['settled_amount'])
+                orig_party = s['party_name']
+
+                c.execute("SELECT description, type, amount FROM cost_items WHERE job_no=?", (j_no,))
+                items = c.fetchall()
+                pay, rec = 0.0, 0.0
+                for c_item in items:
+                    desc = str(c_item['description'] or "").strip().upper()
+                    pn   = orig_party.strip().upper()
+                    if desc == pn or pn in desc or desc in pn:
+                        typ = str(c_item['type']).upper()
+                        amt = float(c_item['amount'] or 0)
+                        if typ == 'PAYABLE':
+                            pay += amt
+                        elif typ == 'RECEIVABLE':
+                            rec += amt
+
+                # ADD INVOICE RECEIVABLE IN EXISTING RECEIPT POPUP
+                try:
+                    c.execute("SELECT * FROM invoice_master WHERE job_no=?", (j_no,))
+                    invs = c.fetchall()
+                    for inv in invs:
+                        inv_no     = str(inv['invoice_no'])
+                        p_name_inv = "UNKNOWN"
+                        if inv['invoice_to']:
+                            p_name_inv = str(inv['invoice_to']).split('\n')[0].strip().upper()
+                        if p_name_inv == "UNKNOWN":
+                            try:
+                                c.execute("SELECT consignee FROM bl_details WHERE job_no=?", (j_no,))
+                                r_bl = c.fetchone()
+                                if r_bl and r_bl['consignee']:
+                                    p_name_inv = str(r_bl['consignee']).split('\n')[0].strip().upper()
+                            except: pass
+                        pn = orig_party.strip().upper()
+                        if p_name_inv in pn or pn in p_name_inv:
+                            inv_amt = 0.0
+                            for tbl in ['invoice_charges', 'invoice_items']:
+                                try:
+                                    c.execute(f"SELECT total FROM {tbl} WHERE job_no=?", (j_no,))
+                                    inv_amt = sum(safe_float(i[0]) for i in c.fetchall())
+                                    if inv_amt > 0: break
+                                except:
+                                    try:
+                                        c.execute(f"SELECT total FROM {tbl} WHERE invoice_no=?", (inv_no,))
+                                        inv_amt = sum(safe_float(i[0]) for i in c.fetchall())
+                                        if inv_amt > 0: break
+                                    except: pass
+                            if inv_amt == 0:
+                                try: inv_amt = safe_float(inv['grand_total'])
+                                except: pass
+                            rec += inv_amt
+                except: pass
+
+                c.execute("SELECT * FROM bl_details WHERE job_no=?", (j_no,))
+                bl_r = c.fetchone()
+                c.execute("SELECT * FROM cost_master WHERE job_no=?", (j_no,))
+                cm_r = c.fetchone()
+                c.execute("SELECT * FROM arrival_details WHERE job_no=?", (j_no,))
+                ar_r = c.fetchone()
+
+                pay = round(pay)
+                rec = round(rec)
+                
+                c.execute("""SELECT SUM(settled_amount) FROM account_settlements 
+                             WHERE job_no=? AND receipt_no!=? AND (
+                               UPPER(party_name) = ?
+                               OR UPPER(?) LIKE '%' || UPPER(party_name) || '%'
+                               OR UPPER(party_name) LIKE '%' || UPPER(?) || '%'
+                             )""", (j_no, existing_receipt_no, orig_party.upper(), orig_party.upper(), orig_party.upper()))
+                res_tmp = c.fetchone()
+                settled_already = safe_float(res_tmp[0] if res_tmp and res_tmp[0] else 0.0)
+                
+                bal = abs(pay - rec)
+                remaining_bal = bal - settled_already
+                if remaining_bal < 0:
+                    remaining_bal = 0.0
+
+                bl  = dict(bl_r) if bl_r else {}
+                cm  = dict(cm_r) if cm_r else {}
+                arr = dict(ar_r) if ar_r else {}
+
+                j_date_str = str(bl.get('job_date', '') or cm.get('eta_date', '') or cm.get('eta', '')).strip()
+                hbl = bl.get('hbl_no', cm.get('hbl_no', ''))
+                pol = bl.get('pol',    cm.get('origin', ''))
+                eta = arr.get('due_arrival', cm.get('eta_date', cm.get('eta', '')))
+
+                create_row(idx+1, j_no, j_date_str[:10], hbl, pol, eta,
+                           pay, rec, remaining_bal, "Regular", "1.000", f"{s_amt:.2f}", orig_party)
+            conn.close()
+
+        def add_blank_row():
+            create_row(len(settle_rows)+1, "", "", "", "", "", "0.00", "0.00", "0.00",
+                       "Regular", "1.000", "", party_name)
+
+        ctk.CTkButton(tbl_f, text="+ Add Manual Row / Credit Note", fg_color="#8b5cf6",
+                      hover_color="#7c3aed", font=("Segoe UI", 11, "bold"),
+                      command=add_blank_row).pack(anchor="w", pady=15, padx=5)
+
+        rem_f = ctk.CTkFrame(bottom_container, fg_color="transparent")
+        rem_f.pack(fill="x", padx=15, pady=(0, 5))
+        ctk.CTkLabel(rem_f, text="Remarks:", font=("Segoe UI", 11, "bold")).pack(side="left", anchor="n")
+        ent_r_remark = ctk.CTkTextbox(rem_f, height=50)
+        ent_r_remark.pack(side="left", fill="x", expand=True, padx=10)
+        if existing_receipt_no:
+            try:
+                if g_rec['remarks']:
+                    ent_r_remark.insert("1.0", g_rec['remarks'])
+            except:
+                pass
+
+        calc_total()
+
+        def save_receipt_only():
+            ent_r_no.configure(state="normal")
+            r_no = ent_r_no.get().strip()
+            ent_r_no.configure(state="disabled")
+            if not r_no:
+                messagebox.showerror("Error", "Receipt No is required!", parent=pop)
+                return
+            total_val = sum(safe_float(get_val(r, 'e_amt')) for r in settle_rows)
+            try:
+                conn = sqlite3.connect(database.DB_FILE)
+                c = conn.cursor()
+                try:
+                    rem_val = ent_r_remark.get("1.0", tk.END).strip()
+                except:
+                    rem_val = ""
+                c.execute("INSERT OR REPLACE INTO global_receipts (receipt_no, date, party, mode, ref_no, currency, total_amount, remarks) VALUES (?,?,?,?,?,?,?,?)",
+                          (r_no, ent_r_date.get(), ent_r_from.get(), ent_r_mode.get(),
+                           ent_r_ref.get(), ent_r_curr.get(), total_val, rem_val))
+                c.execute("DELETE FROM account_settlements WHERE receipt_no=?", (r_no,))
+                for r in settle_rows:
+                    job   = get_val(r, 'e_job').strip()
+                    s_amt = abs(safe_float(get_val(r, 'e_amt')))
+                    p_name = r.get("orig_party", party_name)
+                    if job:
+                        c.execute("INSERT INTO account_settlements (job_no, party_name, settled_amount, receipt_no) VALUES (?,?,?,?)",
+                                  (job, p_name, s_amt, r_no))
+                conn.commit()
+                conn.close()
+                load_report()
+                messagebox.showinfo("Success", "Receipt Saved Successfully!\nStatus has been updated.", parent=pop)
+                pop.destroy()
+            except Exception as e:
+                messagebox.showerror("DB Error", str(e), parent=pop)
+
+        def save_and_print_receipt():
+            ent_r_no.configure(state="normal")
+            r_no = ent_r_no.get().strip()
+            ent_r_no.configure(state="disabled")
+            if not r_no:
+                messagebox.showerror("Error", "Receipt No is required!", parent=pop)
+                if auto_pdf:
+                    pop.destroy()
+                return
+            total_val = sum(safe_float(get_val(r, 'e_amt')) for r in settle_rows)
+            try:
+                conn = sqlite3.connect(database.DB_FILE)
+                c = conn.cursor()
+                try:
+                    rem_val = ent_r_remark.get("1.0", tk.END).strip()
+                except:
+                    rem_val = ""
+                c.execute("INSERT OR REPLACE INTO global_receipts (receipt_no, date, party, mode, ref_no, currency, total_amount, remarks) VALUES (?,?,?,?,?,?,?,?)",
+                          (r_no, ent_r_date.get(), ent_r_from.get(), ent_r_mode.get(),
+                           ent_r_ref.get(), ent_r_curr.get(), total_val, rem_val))
+                c.execute("DELETE FROM account_settlements WHERE receipt_no=?", (r_no,))
+                for r in settle_rows:
+                    job   = get_val(r, 'e_job').strip()
+                    s_amt = abs(safe_float(get_val(r, 'e_amt')))
+                    p_name = r.get("orig_party", party_name)
+                    if job:
+                        c.execute("INSERT INTO account_settlements (job_no, party_name, settled_amount, receipt_no) VALUES (?,?,?,?)",
+                                  (job, p_name, s_amt, r_no))
+                conn.commit()
+                conn.close()
+                load_report()
+            except Exception as e:
+                messagebox.showerror("DB Error", str(e), parent=pop)
+                if auto_pdf:
+                    pop.destroy()
+                return
+
+            try:
+                import tempfile
+                r_no_safe    = r_no.replace('/', '_').replace('\\', '_')
+                party_safe   = party_name.replace('/', '_').replace('\\', '_')
+                if auto_pdf:
+                    pdf_path = os.path.join(tempfile.gettempdir(), f"Receipt_{r_no_safe}_{party_safe}.pdf")
+                else:
+                    pdf_path = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                                            initialfile=f"Receipt_{r_no_safe}_{party_safe}.pdf",
+                                                            parent=pop)
+                if not pdf_path:
+                    return
+
+                c = canvas.Canvas(pdf_path, pagesize=landscape(letter))
+                w, h = landscape(letter)
+
+                logo_path = "company logo.jpeg"
+                if os.path.exists(logo_path):
+                    c.drawImage(logo_path, 40, h - 90, width=130, height=70, preserveAspectRatio=True)
+
+                c.setFont("Helvetica-Bold", 16)
+                c.drawCentredString(w/2 + 50, h - 40, "MK FREIGHT INTERNATIONAL")
+                c.setFont("Helvetica", 10)
+                c.drawCentredString(w/2 + 50, h - 55, "Suite #717, 7th Floor, Trade Avenue Tower 2, Hasrat Mohani Road, Karachi-74000, Pakistan.")
+                c.drawCentredString(w/2 + 50, h - 70, "Email: bdm@mkfreight.com.pk | NTN # 7871477-5")
+                c.setLineWidth(2)
+                c.line(40, h-95, w-40, h-95)
+                c.setLineWidth(1)
+
+                c.setFont("Helvetica-Bold", 12)
+                c.drawString(w-150, h-120, "Adjustment" if ent_r_mode.get() == "Adjustment" else "Receipt")
+                c.line(w-150, h-123, w-40, h-123)
+
+                y = h - 145
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(40, y, "Receipt # :")
+                c.setFont("Helvetica", 10)
+                c.drawString(130, y, r_no)
+                c.line(130, y-2, 300, y-2)
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(550, y, "Date :")
+                c.setFont("Helvetica", 10)
+                c.drawString(600, y, ent_r_date.get())
+                c.line(600, y-2, w-40, y-2)
+
+                y -= 25
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(40, y, "Receive From :")
+                c.setFont("Helvetica", 10)
+                c.drawString(130, y, ent_r_from.get())
+                c.line(130, y-2, 500, y-2)
+
+                y -= 25
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(40, y, "The sum of :")
+                c.setFont("Helvetica", 10)
+                c.drawString(130, y, f"{ent_r_curr.get()} {num_to_words(int(abs(total_val)))} Only")
+                c.line(130, y-2, w-40, y-2)
+
+                y -= 30
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(40, y, "By :")
+                c.setFont("Helvetica", 10)
+                c.drawString(130, y, ent_r_mode.get())
+                c.line(130, y-2, 280, y-2)
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(320, y, "Ref # :")
+                c.setFont("Helvetica", 10)
+                c.drawString(370, y, ent_r_ref.get())
+                c.line(370, y-2, 500, y-2)
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(550, y, "Curr :")
+                c.setFont("Helvetica", 10)
+                c.drawString(600, y, ent_r_curr.get())
+                c.line(600, y-2, w-40, y-2)
+
+                y -= 30
+                def draw_table_header_local(curr_y):
+                    c.setFillColorRGB(0.8, 0.8, 0.8)
+                    c.rect(40, curr_y, w-80, 20, fill=1, stroke=1)
+                    c.setFillColor(colors.black)
+                    c.setFont("Helvetica-Bold", 8)
+                    c.drawString(42,  curr_y+6, "S#")
+                    c.drawString(65,  curr_y+6, "Job No")
+                    c.drawString(115, curr_y+6, "Date")
+                    c.drawString(165, curr_y+6, "HBL")
+                    c.drawString(275, curr_y+6, "POL")
+                    c.drawString(345, curr_y+6, "ETA")
+                    c.drawRightString(460, curr_y+6, "Payable")
+                    c.drawRightString(520, curr_y+6, "Receivbl")
+                    c.drawRightString(580, curr_y+6, "Balance")
+                    c.drawString(600, curr_y+6, "Type")
+                    c.drawString(650, curr_y+6, "Ex.Rt")
+                    c.drawRightString(745, curr_y+6, "Settle Amt")
+                    return curr_y - 15
+
+                y = draw_table_header_local(y)
+                c.setFont("Helvetica", 8)
+                t_pay = t_rec = t_bal = t_set = 0.0
+                for idx, r in enumerate(settle_rows):
+                    if y < 80:
+                        c.showPage()
+                        y = h - 50
+                        y = draw_table_header_local(y)
+                        c.setFont("Helvetica", 8)
+
+                    c.rect(40, y, w-80, 15, stroke=1)
+                    c.drawString(42,  y+4, str(idx+1))
+                    c.drawString(65,  y+4, get_val(r, 'e_job')[:10])
+                    c.drawString(115, y+4, get_val(r, 'e_date')[:10])
+                    c.drawString(165, y+4, get_val(r, 'e_hmbl')[:22])
+                    c.drawString(275, y+4, get_val(r, 'e_pol')[:15])
+                    c.drawString(345, y+4, get_val(r, 'e_eta')[:15])
+                    p_val = safe_float(get_val(r, 'e_pay'))
+                    r_val = safe_float(get_val(r, 'e_rec'))
+                    b_val = safe_float(get_val(r, 'e_bal'))
+                    s_val = safe_float(get_val(r, 'e_amt'))
+                    c.drawRightString(460, y+4, f"{p_val:,.2f}")
+                    c.drawRightString(520, y+4, f"{r_val:,.2f}")
+                    c.drawRightString(580, y+4, f"{b_val:,.2f}")
+                    c.drawString(600,      y+4, get_val(r, 'e_type')[:8])
+                    c.drawString(650,      y+4, get_val(r, 'e_ex'))
+                    c.drawRightString(745, y+4, f"{s_val:,.2f}")
+                    t_set += s_val
+                    t_pay += p_val
+                    t_rec += r_val
+                    t_bal += b_val
+                    y -= 15
+
+                if y < 140:
+                    c.showPage()
+                    y = h - 50
+
+                y -= 25
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(40, y, "Remarks:")
+                c.setFont("Helvetica", 9)
+                import textwrap
+                wrap_rem = textwrap.wrap(rem_val, width=80)
+                rem_y = y
+                for line in wrap_rem[:4]:
+                    c.drawString(95, rem_y, line)
+                    rem_y -= 12
+
+                tot_x_lbl = 580
+                tot_x_val = 745
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(tot_x_lbl, y, "Total Payable:")
+                c.drawRightString(tot_x_val, y, f"{t_pay:,.2f}")
+                y -= 15
+                c.drawString(tot_x_lbl, y, "Total Receivable:")
+                c.drawRightString(tot_x_val, y, f"{t_rec:,.2f}")
+                y -= 15
+                c.drawString(tot_x_lbl, y, "Net Balance:")
+                c.drawRightString(tot_x_val, y, f"{t_bal:,.2f}")
+                y -= 15
+                c.drawString(tot_x_lbl, y, "Total Settled:")
+                c.drawRightString(tot_x_val, y, f"{t_set:,.2f}")
+                y -= 15
+                c.line(tot_x_lbl, y+12, tot_x_val, y+12)
+
+                bal_cents = int(round(t_bal * 100))
+                set_cents = int(round(t_set * 100))
+                rem_cents = bal_cents - set_cents
+                net_remaining = rem_cents / 100.0
+
+                if rem_cents < 0:
+                    c.setFillColor(colors.HexColor("#059669"))
+                    c.setFont("Helvetica-Bold", 10)
+                    c.drawString(tot_x_lbl, y, "EXCESS RECEIVED:")
+                    c.drawRightString(tot_x_val, y, f"{abs(net_remaining):,.2f}")
+                    c.setFillColor(colors.black)
+                elif rem_cents == 0 and set_cents > 0:
+                    c.setFillColor(colors.HexColor("#15803d"))
+                    c.setFont("Helvetica-Bold", 10)
+                    c.drawString(tot_x_lbl, y, "Balance (SETTLED):")
+                    c.drawRightString(tot_x_val, y, "0.00")
+                    c.setFillColor(colors.black)
+                else:
+                    c.drawString(tot_x_lbl, y, "PARTIAL / BAL:")
+                    c.drawRightString(tot_x_val, y, f"{net_remaining:,.2f}")
+
+                c.save()
+                os.startfile(pdf_path)
+                pop.destroy()
+                if not auto_pdf:
+                    messagebox.showinfo("Success", "Receipt Saved & PDF Generated!", parent=app.root)
+            except Exception as e:
+                messagebox.showerror("PDF Error", f"Error generating PDF:\n{str(e)}", parent=pop)
+                if auto_pdf:
+                    pop.destroy()
+
+        if auto_pdf:
+            save_and_print_receipt()
+        else:
+            act_f = ctk.CTkFrame(bottom_container, fg_color="transparent")
+            act_f.pack(pady=20)
+            ctk.CTkButton(act_f, text="💾 Save Receipt", fg_color="#0f766e",
+                          font=("Segoe UI", 12, "bold"), height=40,
+                          command=save_receipt_only).pack(side="left", padx=10)
+            ctk.CTkButton(act_f, text="📄 Save & Download PDF", fg_color="#1d4ed8",
+                          font=("Segoe UI", 12, "bold"), height=40,
+                          command=save_and_print_receipt).pack(side="left", padx=10)
+            ctk.CTkButton(act_f, text="✖ Cancel", fg_color="#ef4444", hover_color="#b91c1c",
+                          font=("Segoe UI", 12, "bold"), height=40,
+                          command=pop.destroy).pack(side="left", padx=10)
+
+    act_f = ctk.CTkFrame(main_card, fg_color="transparent")
+    act_f.pack(pady=10)
+
+    ctk.CTkButton(act_f, text="💵 UPDATE PAYMENTS", fg_color="#10b981", hover_color="#059669",
+                  font=("Segoe UI", 12, "bold"), width=160, height=40,
+                  command=open_payment_popup).pack(side="left", padx=10)
+
+    # ==================== FIX #3: EXCEL EXPORT - REWRITTEN WITH OPENPYXL ====================
+    def export_excel():
+        selected_items = [item for item in report_data if item[0] == "[ \u2713 ]"]
+        if not selected_items:
+            messagebox.showwarning("Selection Required",
+                                   "Please tick the checkbox '[ \u2713 ]' to export the Intimation.",
+                                   parent=app.root)
+            return
+        party_name = selected_items[0][3]
+        for item in selected_items:
+            if item[3] != party_name:
+                messagebox.showwarning("Multiple Parties",
+                                       "Please select jobs belonging to the SAME Party.",
+                                       parent=app.root)
+                return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel Files", "*.xlsx")],
+            initialfile=f"Intimation_{party_name}.xlsx"
+        )
+        if not path:
+            return
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Intimation"
+
+        ws['A1'] = "MK FREIGHT INTERNATIONAL"
+        ws['A1'].font = Font(bold=True, size=14)
+        ws['A2'] = "OUTSTANDING INTIMATION"
+        ws['A2'].font = Font(bold=True, size=12)
+        ws.append([])
+        ws.append(["Intimation No:", f"INT-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                   "Date:", datetime.now().strftime("%d-%b-%Y")])
+        ws.append(["Pending From:", party_name])
+        ws.append([])
+
+        col_headers = ["S#", "Job No", "Date", "MBL/HBL", "POL/POD", "VSL/VOY",
+                       "Payable", "Receivable", "Balance", "Received Payment",
+                       "Total Outstanding", "Status"]
+        ws.append(col_headers)
+        header_row = ws.max_row
+        for cell in ws[header_row]:
+            cell.font      = Font(bold=True, color="FFFFFF")
+            cell.fill      = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+            cell.alignment = Alignment(horizontal="center")
+
+        conn_db = sqlite3.connect(database.DB_FILE)
+        cursor  = conn_db.cursor()
+
+        total_payable = 0.0
+        total_receivable = 0.0
+        total_payment_done = 0.0
+
+        for idx, item in enumerate(selected_items):
+            p = safe_float(item[8])
+            r = safe_float(item[9])
+            b = abs(p - r)
+            cursor.execute("SELECT SUM(settled_amount) FROM account_settlements WHERE job_no=? AND UPPER(party_name)=?",
+                           (item[1], party_name.upper()))
+            rec_res  = cursor.fetchone()
+            received = safe_float(rec_res[0] if rec_res and rec_res[0] else 0.0)
+            
+            total_payable += p
+            total_receivable += r
+            total_payment_done += received
+            
+            outstanding = b - received
+
+            hmbl        = f"{item[11]} / {item[4]}".strip(" /")
+            polpod      = f"{item[6]} / {item[12]}".strip(" /")
+            status_val  = str(item[10])
+            out_display = f"EXS. {abs(outstanding):,.2f}" if outstanding < -0.01 else round(outstanding, 2)
+
+            row_data = [idx+1, item[1], item[2], hmbl, polpod, item[13],
+                        round(p, 2), round(r, 2), round(b, 2),
+                        round(received, 2), out_display, status_val]
+            ws.append(row_data)
+
+            data_row    = ws.max_row
+            status_cell = ws.cell(row=data_row, column=12)
+            status_cell.font = Font(bold=True)
+            status_upper = status_val.upper()
+            if "SETTLED" in status_upper:
+                status_cell.font = Font(bold=True, color="006400")
+            elif "EXCESS RCV" in status_upper:
+                status_cell.font = Font(bold=True, color="006400")
+            elif "PENDING" in status_upper:
+                status_cell.font = Font(bold=True, color="CC0000")
+            elif "NO DUE" in status_upper:
+                status_cell.font = Font(bold=True, color="0000CC")
+            elif "PARTIAL" in status_upper:
+                status_cell.font = Font(bold=True, color="B8860B")
+
+        conn_db.close()
+
+        ws.append([])
+        net_balance = total_payable - total_receivable
+        final_outstanding = abs(net_balance) - total_payment_done
+
+        summary_rows = [
+            ("Total Payable:", total_payable),
+            ("Total Receivable:", total_receivable),
+            ("Net Balance:", net_balance),
+            ("Total Payment Done:", total_payment_done),
+            ("Excess Paid:" if final_outstanding < -0.01 else "Balance Short:", abs(final_outstanding))
+        ]
+
+        for label, val in summary_rows:
+            ws.append(["", "", "", "", "", "", "", "", "", label, val, ""])
+            tr = ws.max_row
+            ws.cell(row=tr, column=10).font = Font(bold=True)
+            val_cell = ws.cell(row=tr, column=11)
+            val_cell.font = Font(bold=True)
+            val_cell.number_format = '#,##0.00'
+            if "Excess" in label:
+                val_cell.font = Font(bold=True, color="008000")
+            elif "Short" in label:
+                val_cell.font = Font(bold=True, color="FF0000")
+
+        col_widths = [5, 12, 12, 28, 22, 20, 14, 14, 14, 18, 18, 16]
+        for i, width in enumerate(col_widths, 1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
+
+        wb.save(path)
+        os.startfile(path)
+    # ==================== END FIX #3 ====================
+
+    ctk.CTkButton(act_f, text="📊 Download Intimation Excel", fg_color="#0f766e",
+                  font=("Segoe UI", 12, "bold"), width=160, height=40,
+                  command=export_excel).pack(side="left", padx=10)
+
+    # ==================== FIX #1 + #2: PDF INTIMATION ====================
+    def download_intimation_pdf():
+        selected_items = [item for item in report_data if item[0] == "[ \u2713 ]"]
+        if not selected_items:
+            messagebox.showwarning("Selection Required",
+                                   "Please tick the checkbox '[ \u2713 ]' to generate the Intimation PDF.",
+                                   parent=app.root)
+            return
+        party_name = selected_items[0][3]
+        for item in selected_items:
+            if item[3] != party_name:
+                messagebox.showwarning("Multiple Parties",
+                                       "Please select jobs belonging to the SAME Party.",
+                                       parent=app.root)
+                return
+
+        p_safe   = party_name.replace('/', '_').replace('\\', '_')
+        pdf_path = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                                initialfile=f"Intimation_{p_safe}.pdf")
+        if not pdf_path: return
+
+        int_no   = f"REC-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        date_str = datetime.now().strftime("%d-%b-%Y")
+
+        c = canvas.Canvas(pdf_path, pagesize=landscape(letter))
+        w, h = landscape(letter)
+
+        logo_path = "company logo.jpeg"
+        if os.path.exists(logo_path):
+            c.drawImage(logo_path, 40, h - 90, width=130, height=70, preserveAspectRatio=True)
+
+        c.setFont("Helvetica-Bold", 16)
+        c.drawCentredString(w/2 + 50, h - 40, "MK FREIGHT INTERNATIONAL")
+        c.setFont("Helvetica", 10)
+        c.drawCentredString(w/2 + 50, h - 55, "Suite #717, 7th Floor, Trade Avenue Tower 2, Hasrat Mohani Road, Karachi-74000, Pakistan.")
+        c.drawCentredString(w/2 + 50, h - 70, "Email: bdm@mkfreight.com.pk | NTN # 7871477-5")
+        c.setLineWidth(2)
+        c.line(40, h-95, w-40, h-95)
+        c.setLineWidth(1)
+
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(w-150, h-120, "OUTSTANDING")
+        c.line(w-150, h-123, w-40, h-123)
+
+        y = h - 145
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(40, y, "Intimation No.# :")
+        c.setFont("Helvetica", 10)
+        c.drawString(140, y, int_no)
+        c.line(140, y-2, 320, y-2)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(550, y, "Date :")
+        c.setFont("Helvetica", 10)
+        c.drawString(600, y, date_str)
+        c.line(600, y-2, w-40, y-2)
+
+        total_payable = 0.0
+        total_receivable = 0.0
+        total_payment_done = 0.0
+        total_out = 0.0
+        job_data  = []
+        conn_db   = sqlite3.connect(database.DB_FILE)
+        cursor    = conn_db.cursor()
+        for item in selected_items:
+            p = safe_float(item[8])
+            r = safe_float(item[9])
+            b = abs(p - r)
+            cursor.execute("SELECT SUM(settled_amount) FROM account_settlements WHERE job_no=? AND UPPER(party_name)=?",
+                           (item[1], party_name.upper()))
+            rec_res  = cursor.fetchone()
+            received = safe_float(rec_res[0] if rec_res and rec_res[0] else 0.0)
+            
+            total_payable += p
+            total_receivable += r
+            total_payment_done += received
+            
+            outstanding = b - received
+            total_out  += outstanding
+            job_data.append((p, r, b, received, outstanding))
+        conn_db.close()
+        
+        net_balance = total_payable - total_receivable
+        final_outstanding = abs(net_balance) - total_payment_done
+
+        y -= 25
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(40, y, "Pending From :")
+        c.setFont("Helvetica", 10)
+        c.drawString(140, y, party_name)
+        c.line(140, y-2, 520, y-2)
+
+        y -= 25
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(40, y, "The sum of :")
+        c.setFont("Helvetica", 10)
+        c.drawString(140, y, f"PKR {num_to_words(int(abs(final_outstanding)))} Only")
+        c.line(140, y-2, w-40, y-2)
+
+        y -= 30
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(40, y, "Curr :")
+        c.setFont("Helvetica", 10)
+        c.drawString(140, y, "PKR")
+        c.line(140, y-2, 300, y-2)
+
+        # FIX #1: CORRECTED COLUMN POSITIONS
+        COL_SN    = 42
+        COL_JOB   = 60
+        COL_DATE  = 110
+        COL_MBL   = 165
+        COL_POL   = 240
+        COL_VSL   = 330
+        COL_PAY_R = 435
+        COL_REC_R = 495
+        COL_BAL_R = 555
+        COL_RECV_R= 615
+        COL_OUT_R = 680
+        COL_STAT  = 690
+
+        y -= 30
+        c.setFillColorRGB(0.8, 0.8, 0.8)
+        c.rect(40, y, w-80, 20, fill=1, stroke=1)
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(COL_SN,   y+6, "S#")
+        c.drawString(COL_JOB,  y+6, "Job No")
+        c.drawString(COL_DATE, y+6, "Date")
+        c.drawString(COL_MBL,  y+6, "HBL")
+        c.drawString(COL_POL,  y+6, "POL")
+        c.drawString(COL_VSL,  y+6, "ETA")
+        c.drawRightString(COL_PAY_R,  y+6, "Payable")
+        c.drawRightString(COL_REC_R,  y+6, "Receivbl")
+        c.drawRightString(COL_BAL_R,  y+6, "Balance")
+        c.drawRightString(COL_RECV_R, y+6, "Received")
+        c.drawRightString(COL_OUT_R,  y+6, "Outstand")
+        c.drawString(COL_STAT, y+6, "Status")
+
+        y -= 15
+        c.setFont("Helvetica", 8)
+        for idx, (item, data) in enumerate(zip(selected_items, job_data)):
+            c.rect(40, y, w-80, 15, stroke=1)
+            c.drawString(COL_SN,   y+4, str(idx+1))
+            c.drawString(COL_JOB,  y+4, str(item[1])[:10])
+            c.drawString(COL_DATE, y+4, str(item[2])[:11])
+            c.drawString(COL_MBL,  y+4, str(item[4])[:15])
+            c.drawString(COL_POL,  y+4, str(item[6])[:15])
+            c.drawString(COL_VSL,  y+4, str(item[7])[:15])
+            p, r, b, rec_val, out_val = data
+            c.drawRightString(COL_PAY_R,  y+4, f"{p:,.2f}")
+            c.drawRightString(COL_REC_R,  y+4, f"{r:,.2f}")
+            c.drawRightString(COL_BAL_R,  y+4, f"{b:,.2f}")
+            c.drawRightString(COL_RECV_R, y+4, f"{rec_val:,.2f}")
+            out_str = f"EXS. {abs(out_val):,.2f}" if out_val < -0.01 else f"{out_val:,.2f}"
+            c.drawRightString(COL_OUT_R, y+4, out_str)
+
+            # FIX #2: STATUS - Bold, Uppercase, Colored
+            status_raw = str(item[10]).strip().upper()
+            c.setFont("Helvetica-Bold", 8)
+            if status_raw == "SETTLED":
+                c.setFillColor(colors.HexColor("#15803d"))
+                status_text = "✔ SETTLED"
+            elif status_raw == "EXCESS RCV":
+                c.setFillColor(colors.HexColor("#059669"))
+                status_text = "⚠ EXCESS RCV"
+            elif status_raw == "PENDING":
+                c.setFillColor(colors.HexColor("#dc2626"))
+                status_text = "⚑ PENDING"
+            elif status_raw in ("NO DUE",):
+                c.setFillColor(colors.HexColor("#1d4ed8"))
+                status_text = "⚑ NO DUES"
+            elif "PARTIAL" in status_raw:
+                c.setFillColor(colors.HexColor("#b45309"))
+                status_text = "⚑ PARTIAL PMT"
+            else:
+                c.setFillColor(colors.black)
+                status_text = status_raw
+            c.drawString(COL_STAT, y+4, status_text[:14])
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica", 8)
+
+            y -= 15
+            if y < 120:
+                c.showPage()
+                y = h - 50
+                c.setFont("Helvetica", 8)
+
+        if y < 160:
+            c.showPage()
+            y = h - 50
+
+        y -= 15
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(420, y, "Total Payable :")
+        c.drawRightString(COL_OUT_R, y, f"{total_payable:,.2f}")
+        
+        y -= 15
+        c.drawString(420, y, "Total Receivable :")
+        c.drawRightString(COL_OUT_R, y, f"{total_receivable:,.2f}")
+        
+        y -= 15
+        c.drawString(420, y, "Net Balance :")
+        c.drawRightString(COL_OUT_R, y, f"{net_balance:,.2f}")
+        
+        y -= 15
+        c.drawString(420, y, "Total Payment Done :")
+        c.drawRightString(COL_OUT_R, y, f"{total_payment_done:,.2f}")
+        
+        y -= 15
+        if final_outstanding < -0.01:
+            c.setFillColor(colors.HexColor("#059669"))
+            c.drawString(420, y, "Excess Paid :")
+            c.drawRightString(COL_OUT_R, y, f"{abs(final_outstanding):,.2f}")
+        else:
+            c.setFillColor(colors.HexColor("#dc2626"))
+            c.drawString(420, y, "Balance Short :")
+            c.drawRightString(COL_OUT_R, y, f"{final_outstanding:,.2f}")
+        c.setFillColor(colors.black)
+
+        # Footer
+        footer_y = 70
+        c.setLineWidth(1)
+        c.setStrokeColor(colors.HexColor("#1e3a8a"))
+        c.line(40, footer_y, w-40, footer_y)
+        c.setStrokeColor(colors.black)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(40, footer_y - 15, "Bank Details: ")
+        c.setFont("Helvetica", 9)
+        c.drawString(110, footer_y - 15, "MK Freight International | A/C: 6111220311714233882 | Habib Metropolitan Bank Ltd")
+        c.drawString(110, footer_y - 27, "IBAN: PK89 MPBL 1112 0271 4023 3882 | Branch: Hasrat Mohani")
+        c.setFont("Helvetica-Oblique", 8)
+        c.setFillColor(colors.gray)
+        c.drawString(40, footer_y - 45, "Note: This is a system-generated intimation and does not require a physical signature.")
+        c.save()
+        os.startfile(pdf_path)
+    # ==================== END FIX #1 + #2 ====================
+
+    ctk.CTkButton(act_f, text="📄 Download Intimation PDF", fg_color="#be123c",
+                  font=("Segoe UI", 12, "bold"), width=160, height=40,
+                  command=download_intimation_pdf).pack(side="left", padx=10)
+
+    # UPDATE-2: Download Global Report
+    def download_global_report():
+        if not report_data:
+            messagebox.showwarning("No Data", "Please click Generate first to load data.", parent=app.root)
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel Files", "*.xlsx")],
+            initialfile=f"Global_Profit_Report_{datetime.now().strftime('%d-%b-%Y')}.xlsx"
+        )
+        if not path:
+            return
+    
+        # --- 1. Pre-calculate all data and summaries ---
+        total_revenue = 0
+        total_cost = 0
+        profit_jobs = 0
+        loss_jobs = 0
+        processed_jobs = []
+    
+        for item in report_data:
+            revenue = safe_float(item[9])
+            cost = safe_float(item[8])
+            profit = revenue - cost
+    
+            total_revenue += revenue
+            total_cost += cost
+    
+            if profit > 0.01:
+                profit_jobs += 1
+                status = "PROFIT"
+            elif profit < -0.01:
+                loss_jobs += 1
+                status = "LOSS"
+            else:
+                status = "BREAK EVEN"
+    
+            processed_jobs.append({
+                "job_no": item[1],
+                "date": item[2],
+                "party": item[3],
+                "hbl": item[4],
+                "container": item[5],
+                "pol": item[6],
+                "eta": item[7],
+                "revenue": revenue,
+                "cost": cost,
+                "profit": profit,
+                "status": status
+            })
+    
+        # --- 2. Create Excel Workbook and Styles ---
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Profitability Report"
+    
+        # Styles
+        bold_font = Font(bold=True)
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+        profit_font = Font(bold=True, color="008000")
+        loss_font = Font(bold=True, color="FF0000")
+        center_align = Alignment(horizontal="center")
+    
+        # --- 3. Write Top Summary ---
+        ws['A1'] = "MK FREIGHT INTERNATIONAL"
+        ws['A1'].font = Font(bold=True, size=16)
+        ws['A2'] = "JOB PROFITABILITY REPORT"
+        ws['A2'].font = Font(bold=True, size=13)
+        ws.append([])
+    
+        summary_data = [
+            ("Total Revenue (Receivable)", total_revenue),
+            ("Total Cost (Payable)", total_cost),
+            ("Gross Profit / Loss", total_revenue - total_cost),
+            ("Total Jobs", len(report_data)),
+            ("Profit Jobs", profit_jobs),
+            ("Loss Jobs", loss_jobs)
+        ]
+    
+        for i, (label, value) in enumerate(summary_data, 4):
+            ws[f'A{i}'] = label
+            ws[f'A{i}'].font = bold_font
+            ws[f'B{i}'] = value
+            if isinstance(value, (int, float)):
+                ws[f'B{i}'].number_format = '#,##0.00'
+    
+        # --- 4. Write Main Table ---
+        ws.append([])
+        main_headers = ["JOB NO", "DATE", "PARTY", "HBL NO", "CONTAINER NO", "POL", "ETA",
+                        "REVENUE", "COST", "PROFIT", "STATUS"]
+        ws.append(main_headers)
+        header_row_num = ws.max_row
+        for cell in ws[header_row_num]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_align
+    
+        for job in processed_jobs:
+            row_data = [
+                job["job_no"], job["date"], job["party"], job["hbl"], job["container"],
+                job["pol"], job["eta"], job["revenue"], job["cost"], job["profit"],
+                job["status"]
+            ]
+            ws.append(row_data)
+            current_row = ws.max_row
+            for col_idx in [8, 9, 10]:
+                ws.cell(row=current_row, column=col_idx).number_format = '#,##0.00'
+            status_cell = ws.cell(row=current_row, column=11)
+            if job["status"] == "PROFIT":
+                status_cell.font = profit_font
+            elif job["status"] == "LOSS":
+                status_cell.font = loss_font
+    
+        # --- 5. Write Bottom Summary ---
+        ws.append([])
+        ws.append(["", "", "", "", "", "", "Total Revenue:", total_revenue])
+        ws.append(["", "", "", "", "", "", "Total Cost:", total_cost])
+        ws.append(["", "", "", "", "", "", "Net Profit / Loss:", total_revenue - total_cost])
+    
+        for i in range(3):
+            row_num = ws.max_row - i
+            ws.cell(row=row_num, column=7).font = bold_font
+            ws.cell(row=row_num, column=8).font = bold_font
+            ws.cell(row=row_num, column=8).number_format = '#,##0.00'
+    
+        # --- 6. Final Formatting ---
+        col_widths = {'A': 15, 'B': 12, 'C': 30, 'D': 20, 'E': 20, 'F': 12, 'G': 12,
+                      'H': 14, 'I': 14, 'J': 14, 'K': 12}
+        for col, width in col_widths.items():
+            ws.column_dimensions[col].width = width
+    
+        try:
+            wb.save(path)
+            os.startfile(path)
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save Excel file:\n{e}", parent=app.root)
+
+    ctk.CTkButton(act_f, text="📊 Download Global Report", fg_color="#7c3aed", hover_color="#6d28d9",
+                  font=("Segoe UI", 12, "bold"), width=180, height=40,
+                  command=download_global_report).pack(side="left", padx=10)
+
+    load_report()
